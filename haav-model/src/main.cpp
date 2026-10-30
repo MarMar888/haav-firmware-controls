@@ -4,23 +4,80 @@
 XboxSeriesXControllerESP32_asukiaaa::Core xboxController("0c:35:26:fd:09:85");
 
 const int ESC_COUNT = 2;
-const int ESC_PIN[ESC_COUNT] = {D10, D9};  // ESC index = LEDC channel
+const int ESC_PIN[ESC_COUNT] = {D10, D9};  // left motor, right motor
+const int LEFT_MOTOR = 0;
+const int RIGHT_MOTOR = 1;
 const int PWM_HZ = 50;
 const int PWM_BITS = 14;
+const float JOYSTICK_DEADZONE = 0.1f;
+const float INPUT_SMOOTHING = 0.18f;
+const float MOTOR_SLEW_PER_SECOND = 2.5f;
+const unsigned long REVERSE_NEUTRAL_MS = 1000;
 
 // Reversible ESC: 1500 us is stopped (and arms the ESC), 1000/2000 us are full reverse/forward.
 const int NEUTRAL_US = 1500;
 const int RANGE_US = 500;
 
 void writePulse(int esc, int us) {
-  ledcWrite(esc, (uint32_t)us * PWM_HZ * ((1 << PWM_BITS) - 1) / 1000000);
+  ledcWrite(ESC_PIN[esc],
+            (uint32_t)us * PWM_HZ * ((1 << PWM_BITS) - 1) / 1000000);
+}
+
+float normalizeJoystick(uint16_t value, bool invert) {
+  const float center = XboxControllerNotificationParser::maxJoy / 2.0f;
+  float normalized = ((float)value - center) / center;
+  if (invert) {
+    normalized = -normalized;
+  }
+  if (fabs(normalized) < JOYSTICK_DEADZONE) {
+    return 0;
+  }
+  return normalized > 0
+             ? (normalized - JOYSTICK_DEADZONE) / (1 - JOYSTICK_DEADZONE)
+             : (normalized + JOYSTICK_DEADZONE) / (1 - JOYSTICK_DEADZONE);
+}
+
+float smoothCommand(float target, float &filtered) {
+  filtered += (target - filtered) * INPUT_SMOOTHING;
+  return filtered;
+}
+
+float rampMotor(float target, float &current, unsigned long &zeroSince,
+                unsigned long now, float elapsedSeconds) {
+  const bool changingDirection = current != 0 && target != 0 &&
+                                 ((current > 0) != (target > 0));
+  if (changingDirection) {
+    target = 0;
+  }
+
+  if (target == 0 && current == 0) {
+    if (zeroSince == 0) {
+      zeroSince = now;
+    }
+    return 0;
+  } else if (target != 0) {
+    if (zeroSince != 0) {
+      if (now - zeroSince < REVERSE_NEUTRAL_MS) {
+        return 0;
+      }
+      zeroSince = 0;
+    }
+  }
+
+  float change = target - current;
+  float maxChange = MOTOR_SLEW_PER_SECOND * elapsedSeconds;
+  if (fabs(change) <= maxChange) {
+    current = target;
+  } else {
+    current += change > 0 ? maxChange : -maxChange;
+  }
+  return current;
 }
 
 void setup() {
   Serial.begin(115200);
   for (int esc = 0; esc < ESC_COUNT; esc++) {
-    ledcSetup(esc, PWM_HZ, PWM_BITS);
-    ledcAttachPin(ESC_PIN[esc], esc);
+    ledcAttach(ESC_PIN[esc], PWM_HZ, PWM_BITS);
     writePulse(esc, NEUTRAL_US);  // hold neutral from power-up so the ESCs arm
   }
 
@@ -35,24 +92,64 @@ void loop() {
     ESP.restart();
   }
 
-  // Throttle in [-1, 1]: right trigger forward, left trigger reverse. Stop if the controller drops.
+  // The left stick uses arcade mixing: vertical controls speed and horizontal
+  // steering makes one motor faster than the other.
   auto &n = xboxController.xboxNotif;
   bool connected = xboxController.isConnected() && !xboxController.isWaitingForFirstNotification();
-  float throttle = 0;
+  float leftThrottle = 0;
+  float rightThrottle = 0;
   if (connected) {
-    throttle = (float)(n.trigRT - n.trigLT) / XboxControllerNotificationParser::maxTrig;
+    float forward = normalizeJoystick(n.joyLVert, true);
+    float turn = normalizeJoystick(n.joyLHori, false);
+    leftThrottle = forward + turn;
+    rightThrottle = forward - turn;
+
+    float maxThrottle = max(fabs(leftThrottle), fabs(rightThrottle));
+    if (maxThrottle > 1) {
+      leftThrottle /= maxThrottle;
+      rightThrottle /= maxThrottle;
+    }
+    if (n.btnLB) {
+      leftThrottle = -leftThrottle;
+    }
+    if (n.btnRB) {
+      rightThrottle = -rightThrottle;
+    }
   }
-  int pulseUs = NEUTRAL_US + throttle * RANGE_US;
-  for (int esc = 0; esc < ESC_COUNT; esc++) {
-    writePulse(esc, pulseUs);  // both ESCs get the same output for now
+  static float currentLeftThrottle = 0;
+  static float currentRightThrottle = 0;
+  static float filteredLeftThrottle = 0;
+  static float filteredRightThrottle = 0;
+  static unsigned long leftZeroSince = 0;
+  static unsigned long rightZeroSince = 0;
+  static unsigned long lastMotorUpdate = millis();
+  unsigned long now = millis();
+  float elapsedSeconds = min((now - lastMotorUpdate) / 1000.0f, 0.1f);
+  lastMotorUpdate = now;
+
+  if (!connected) {
+    filteredLeftThrottle = 0;
+    filteredRightThrottle = 0;
+  } else {
+    leftThrottle = smoothCommand(leftThrottle, filteredLeftThrottle);
+    rightThrottle = smoothCommand(rightThrottle, filteredRightThrottle);
   }
+  leftThrottle = rampMotor(filteredLeftThrottle, currentLeftThrottle,
+                           leftZeroSince, now, elapsedSeconds);
+  rightThrottle = rampMotor(filteredRightThrottle, currentRightThrottle,
+                            rightZeroSince, now, elapsedSeconds);
+
+  int leftPulseUs = NEUTRAL_US + currentLeftThrottle * RANGE_US;
+  int rightPulseUs = NEUTRAL_US + currentRightThrottle * RANGE_US;
+  writePulse(LEFT_MOTOR, leftPulseUs);
+  writePulse(RIGHT_MOTOR, rightPulseUs);
 
   static unsigned long lastLogAt = 0;
   if (millis() - lastLogAt >= 200) {
     lastLogAt = millis();
-    const char *dir = throttle > 0 ? "FWD" : throttle < 0 ? "REV" : "STOP";
-    Serial.printf("%s | RT %4u LT %4u | ESCs %4d us %-4s (%+.0f%%)\n",
-                  connected ? "CONNECTED" : "NO CTRL  ", n.trigRT, n.trigLT, pulseUs, dir, throttle * 100);
+    Serial.printf("%s | LX %5u LY %5u | %4d us %4d us\n",
+                  connected ? "CONNECTED" : "NO CTRL  ",
+                  n.joyLHori, n.joyLVert, leftPulseUs, rightPulseUs);
   }
 
   delay(10);
