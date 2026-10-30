@@ -5,6 +5,7 @@ XboxSeriesXControllerESP32_asukiaaa::Core xboxController("0c:35:26:fd:09:85");
 
 const int ESC_COUNT = 2;
 const int ESC_PIN[ESC_COUNT] = {D10, D9};  // left motor, right motor
+const int SERVO_PIN = D8;
 const int LEFT_MOTOR = 0;
 const int RIGHT_MOTOR = 1;
 const int PWM_HZ = 50;
@@ -18,8 +19,8 @@ const unsigned long REVERSE_NEUTRAL_MS = 1000;
 const int NEUTRAL_US = 1500;
 const int RANGE_US = 500;
 
-void writePulse(int esc, int us) {
-  ledcWrite(ESC_PIN[esc],
+void writePulse(int pin, int us) {
+  ledcWrite(pin,
             (uint32_t)us * PWM_HZ * ((1 << PWM_BITS) - 1) / 1000000);
 }
 
@@ -78,8 +79,10 @@ void setup() {
   Serial.begin(115200);
   for (int esc = 0; esc < ESC_COUNT; esc++) {
     ledcAttach(ESC_PIN[esc], PWM_HZ, PWM_BITS);
-    writePulse(esc, NEUTRAL_US);  // hold neutral from power-up so the ESCs arm
+    writePulse(ESC_PIN[esc], NEUTRAL_US);  // hold neutral from power-up
   }
+  ledcAttach(SERVO_PIN, PWM_HZ, PWM_BITS);
+  writePulse(SERVO_PIN, NEUTRAL_US);  // stop a continuous-rotation servo
 
   xboxController.begin();
 }
@@ -141,15 +144,24 @@ void loop() {
 
   int leftPulseUs = NEUTRAL_US + currentLeftThrottle * RANGE_US;
   int rightPulseUs = NEUTRAL_US + currentRightThrottle * RANGE_US;
-  writePulse(LEFT_MOTOR, leftPulseUs);
-  writePulse(RIGHT_MOTOR, rightPulseUs);
+  writePulse(ESC_PIN[LEFT_MOTOR], leftPulseUs);
+  writePulse(ESC_PIN[RIGHT_MOTOR], rightPulseUs);
+
+  static float filteredServoCommand = 0;
+  float servoCommand = connected
+                          ? normalizeJoystick(n.joyRHori, false)
+                          : 0;
+  servoCommand = smoothCommand(servoCommand, filteredServoCommand);
+  int servoPulseUs = NEUTRAL_US + filteredServoCommand * RANGE_US;
+  writePulse(SERVO_PIN, servoPulseUs);
 
   static unsigned long lastLogAt = 0;
   if (millis() - lastLogAt >= 200) {
     lastLogAt = millis();
-    Serial.printf("%s | LX %5u LY %5u | %4d us %4d us\n",
+    Serial.printf("%s | LX %5u LY %5u | RX %5u | %4d us %4d us S %4d us\n",
                   connected ? "CONNECTED" : "NO CTRL  ",
-                  n.joyLHori, n.joyLVert, leftPulseUs, rightPulseUs);
+                  n.joyLHori, n.joyLVert, n.joyRHori,
+                  leftPulseUs, rightPulseUs, servoPulseUs);
   }
 
   delay(10);
