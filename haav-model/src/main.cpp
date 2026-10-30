@@ -1,79 +1,54 @@
 #include <Arduino.h>
-// Uncomment for the library's own verbose BLE logging (scan results, retries, raw packets)
-// #define XBOX_SERIES_X_CONTROLLER_DEBUG_SERIAL Serial
 #include <XboxSeriesXControllerESP32_asukiaaa.hpp>
 
-// Connects to any Xbox controller in pairing mode.
-// To lock to one controller, pass its MAC: xboxController("44:16:22:5e:b2:d4");
 XboxSeriesXControllerESP32_asukiaaa::Core xboxController("0c:35:26:fd:09:85");
 
-enum class LinkState { Idle, Scanning, WaitingForFirstNotification, Connected };
+const int ESC_PIN = D10;
+const int ESC_CHANNEL = 0;
+const int PWM_HZ = 50;
+const int PWM_BITS = 14;
 
-const char *linkStateName(LinkState s) {
-  switch (s) {
-    case LinkState::Idle: return "IDLE (connecting / between scans)";
-    case LinkState::Scanning: return "SCANNING (hold pair button until logo flashes fast)";
-    case LinkState::WaitingForFirstNotification: return "CONNECTED, waiting for first input packet";
-    case LinkState::Connected: return "CONNECTED, receiving input";
-  }
-  return "?";
+// Reversible ESC: 1500 us is stopped (and arms the ESC), 1000/2000 us are full reverse/forward.
+const int NEUTRAL_US = 1500;
+const int RANGE_US = 500;
+
+void writePulse(int us) {
+  ledcWrite(ESC_CHANNEL, (uint32_t)us * PWM_HZ * ((1 << PWM_BITS) - 1) / 1000000);
 }
-
-LinkState readLinkState() {
-  if (xboxController.isConnected()) {
-    return xboxController.isWaitingForFirstNotification() ? LinkState::WaitingForFirstNotification
-                                                          : LinkState::Connected;
-  }
-  return NimBLEDevice::getScan()->isScanning() ? LinkState::Scanning : LinkState::Idle;
-}
-
-LinkState lastState = LinkState::Idle;
-uint8_t lastFailCount = 0;
-unsigned long lastPrintAt = 0;
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);  // give USB serial time to attach so early logs aren't lost
-  Serial.println("[xbox] Starting NimBLE client");
+  ledcSetup(ESC_CHANNEL, PWM_HZ, PWM_BITS);
+  ledcAttachPin(ESC_PIN, ESC_CHANNEL);
+  writePulse(NEUTRAL_US);  // hold neutral from power-up so the ESC arms
+
   xboxController.begin();
-  Serial.println("[xbox] BLE initialized");
 }
 
 void loop() {
   xboxController.onLoop();
 
-  LinkState state = readLinkState();
-  if (state != lastState) {
-    Serial.printf("[xbox] %lu ms: %s -> %s\n", millis(), linkStateName(lastState), linkStateName(state));
-    if (state == LinkState::Connected) {
-      Serial.printf("[xbox] Controller address: %s\n", xboxController.buildDeviceAddressStr().c_str());
-    }
-    lastState = state;
-  }
-
-  uint8_t failCount = xboxController.getCountFailedConnection();
-  if (failCount != lastFailCount) {
-    Serial.printf("[xbox] Failed connection attempts: %u\n", failCount);
-    lastFailCount = failCount;
-  }
-  if (failCount > 2) {
-    Serial.println("[xbox] Too many failed attempts, restarting ESP32");
-    delay(100);
+  // The library can get stuck after repeated failed connects; a reboot recovers it.
+  if (xboxController.getCountFailedConnection() > 2) {
     ESP.restart();
   }
 
-  if (state == LinkState::Connected && millis() - lastPrintAt >= 200) {
-    lastPrintAt = millis();
-    auto &n = xboxController.xboxNotif;
-    const float joyMax = XboxControllerNotificationParser::maxJoy;
-    const float trigMax = XboxControllerNotificationParser::maxTrig;
+  // Throttle in [-1, 1]: right trigger forward, left trigger reverse. Stop if the controller drops.
+  auto &n = xboxController.xboxNotif;
+  bool connected = xboxController.isConnected() && !xboxController.isWaitingForFirstNotification();
+  float throttle = 0;
+  if (connected) {
+    throttle = (float)(n.trigRT - n.trigLT) / XboxControllerNotificationParser::maxTrig;
+  }
+  int pulseUs = NEUTRAL_US + throttle * RANGE_US;
+  writePulse(pulseUs);
 
-    Serial.printf("LX %.2f LY %.2f RX %.2f RY %.2f LT %.2f RT %.2f A%d B%d X%d Y%d | last packet %lu ms ago\n",
-                  n.joyLHori / joyMax, n.joyLVert / joyMax,
-                  n.joyRHori / joyMax, n.joyRVert / joyMax,
-                  n.trigLT / trigMax, n.trigRT / trigMax,
-                  n.btnA, n.btnB, n.btnX, n.btnY,
-                  millis() - xboxController.getReceiveNotificationAt());
+  static unsigned long lastLogAt = 0;
+  if (millis() - lastLogAt >= 200) {
+    lastLogAt = millis();
+    const char *dir = throttle > 0 ? "FWD" : throttle < 0 ? "REV" : "STOP";
+    Serial.printf("%s | RT %4u LT %4u | ESC %4d us %-4s (%+.0f%%)\n",
+                  connected ? "CONNECTED" : "NO CTRL  ", n.trigRT, n.trigLT, pulseUs, dir, throttle * 100);
   }
 
   delay(10);
